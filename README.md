@@ -1,7 +1,13 @@
 # SN Project Bundle
 
-This repository is a sanitized code bundle for my substantia nigra imaging
-work. The code centers on two closely related problems:
+I build research imaging workflows that have to do two things at the same
+time: produce analysis-ready outputs reliably and make it possible to measure
+whether those outputs are anatomically credible. This repository is a public,
+sanitized code sample from my substantia nigra imaging work, centered on
+neuromelanin processing and mask-alignment improvement against manual KW
+tracings.
+
+The code centers on two closely related problems:
 
 1. building and refreshing subject-space neuromelanin analysis inputs
 2. improving the geometric alignment of substantia nigra group masks against
@@ -11,6 +17,28 @@ The scripts are research-pipeline code rather than a polished software package.
 They show how I structured multi-stage imaging workflows, tracked dependencies
 across spaces and modalities, and built reusable tooling around registration,
 mask generation, QC, and downstream analysis.
+
+## Technical Highlights
+
+- multi-stage imaging pipeline design across Bash, Python, MATLAB, and R
+- subject-space mask generation from atlas/template inputs plus warp chains
+- geometry scoring against manual tracings using distance- and overlap-based
+  summaries
+- batch-oriented QC and manifest generation for auditable reruns
+- separation between production refresh code and correction/optimization code
+
+## Workflow Diagram
+
+```mermaid
+flowchart LR
+    A[Repair Missing Inputs] --> B[Build or Refresh Warps and Affines]
+    B --> C[Generate Subject-Space SN Masks]
+    C --> D[Extract Neuromelanin Metrics]
+    C --> E[Score Mask Geometry vs KW Tracings]
+    E --> F[Run Alignment Rescue or Correction Strategy]
+    F --> C
+    D --> G[Downstream Analysis and Reporting]
+```
 
 ## Repository Layout
 
