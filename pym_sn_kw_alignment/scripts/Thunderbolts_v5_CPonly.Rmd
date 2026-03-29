@@ -1,0 +1,505 @@
+---
+title: "THUNDERBOLTS V5 CP-Only"
+subtitle: "SNHEART Irredeemable CP-mask analyses without nigrosomes"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: null
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center')
+```
+
+# Section 01 — Plotting Parameters and Theme
+
+```{r plotting-theme}
+library(tidyverse)
+library(glue)
+library(scales)
+library(patchwork)
+
+text.size <- 10
+gg_theme_sn_asr <- theme(
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.background = element_blank(),
+  panel.spacing = unit(0.3, 'in'),
+  axis.line.x = element_line(size = 0.5, colour = 'black'),
+  axis.line.y = element_line(size = 0.5, colour = 'black'),
+  axis.title = element_text(size = text.size),
+  axis.text = element_text(size = text.size),
+  strip.background = element_rect(colour = 'black'),
+  strip.text = element_text(size = text.size),
+  legend.direction = 'horizontal',
+  legend.spacing = unit(0.02, 'in'),
+  legend.position = 'top',
+  legend.background = element_blank(),
+  legend.margin = margin(rep(0.1, 4)),
+  legend.key = element_rect(fill = NA),
+  legend.title = element_blank(),
+  legend.text = element_text(size = 12),
+  legend.text.align = 1,
+  plot.margin = margin(t = 8, r = 12, b = 8, l = 12)
+)
+
+wrap_text <- function(text, width = 90) stringr::str_wrap(text, width = width)
+
+describe_test <- function(title, question, details) {
+  cat(glue("**Test: {title}.** {wrap_text(question)}\n\n_Key setup_: {wrap_text(details)}\n\n"))
+}
+
+describe_plot <- function(title, interpretation) {
+  cat(glue("**How to read the plot:** {wrap_text(title)}. {wrap_text(interpretation)}\n\n"))
+}
+```
+
+# Section 02 — Helper Functions
+
+```{r helper-functions}
+read_delim_auto <- function(path) {
+  if (!file.exists(path)) {
+    stop(glue("File not found: {path}"))
+  }
+  if (grepl("\\.tsv$", path)) {
+    readr::read_tsv(path, show_col_types = FALSE)
+  } else {
+    readr::read_csv(path, show_col_types = FALSE)
+  }
+}
+
+first_existing <- function(paths) {
+  matches <- paths[file.exists(paths)]
+  if (length(matches) == 0) return(NA_character_)
+  matches[[1]]
+}
+
+clean_factor <- function(values, drop_levels = c('NaN', 'NA', 'Unknown', '')) {
+  factor_values <- factor(values)
+  factor_values[factor_values %in% drop_levels] <- NA
+  forcats::fct_drop(factor_values)
+}
+
+resolve_numeric_column <- function(df, candidates) {
+  if (nrow(df) == 0) return(numeric())
+  resolved <- rep(NA_real_, nrow(df))
+  for (nm in candidates) {
+    if (nm %in% names(df)) {
+      vals <- suppressWarnings(as.numeric(df[[nm]]))
+      replace_idx <- is.na(resolved)
+      resolved[replace_idx] <- vals[replace_idx]
+    }
+  }
+  resolved
+}
+
+resolve_gender_column <- function(df) {
+  if (nrow(df) == 0) return(character())
+  resolved <- rep(NA_character_, nrow(df))
+  candidates <- c('gender', 'Gender', 'sex', 'Sex', 'SEX')
+  for (nm in candidates) {
+    if (nm %in% names(df)) {
+      vals <- as.character(df[[nm]])
+      vals <- trimws(vals)
+      replace_idx <- is.na(resolved) | resolved == ''
+      resolved[replace_idx] <- vals[replace_idx]
+    }
+  }
+  resolved[resolved %in% c('M','MALE','Male','male','1')] <- 'Male'
+  resolved[resolved %in% c('F','FEMALE','Female','female','0')] <- 'Female'
+  resolved
+}
+
+resolve_race_column <- function(df) {
+  if (nrow(df) == 0) return(character())
+  resolved <- if ('race' %in% names(df)) as.character(df$race) else rep(NA_character_, nrow(df))
+  candidates <- c('Race', 'race_clean', 'Race_clean')
+  for (nm in candidates) {
+    if (nm %in% names(df)) {
+      vals <- as.character(df[[nm]])
+      vals <- trimws(vals)
+      replace_idx <- is.na(resolved) | resolved == ''
+      resolved[replace_idx] <- vals[replace_idx]
+    }
+  }
+  resolved[resolved %in% c('', 'NA')] <- NA_character_
+  resolved
+}
+
+collapse_race_group <- function(values) {
+  lowered <- tolower(trimws(as.character(values)))
+  collapsed <- rep(NA_character_, length(lowered))
+
+  collapsed[lowered %in% c('white')] <- 'White'
+  collapsed[lowered %in% c('black')] <- 'Black'
+  collapsed[lowered %in% c('hispanic', 'latina', 'latinx', 'mexican')] <- 'Hispanic/Latinx'
+  collapsed[lowered %in% c('asian', 'filipino', 'vietnamese')] <- 'Asian'
+  collapsed[lowered %in% c('multiracial', 'native american', 'native indian', 'persian')] <- 'Other/Indigenous/Mixed'
+
+  missing_idx <- lowered %in% c('', 'na', 'nan', 'unknown', 'n/a')
+  collapsed[missing_idx] <- NA_character_
+
+  # Any leftover non-empty values roll into the grouped "other" bucket.
+  other_idx <- is.na(collapsed) & !missing_idx
+  collapsed[other_idx] <- 'Other/Indigenous/Mixed'
+  collapsed
+}
+
+safe_cor_frame <- function(df, x_col, y_col, label) {
+  needed <- c(x_col, y_col)
+  if (!all(needed %in% names(df))) {
+    return(tibble(metric = label, n = 0L, correlation = NA_real_))
+  }
+  tmp <- df %>% select(all_of(needed)) %>% drop_na()
+  tibble(
+    metric = label,
+    n = nrow(tmp),
+    correlation = if (nrow(tmp) < 2) NA_real_ else cor(tmp[[x_col]], tmp[[y_col]], use = 'complete.obs')
+  )
+}
+
+safe_lm_summary <- function(df, response, predictors, label) {
+  needed <- c(response, predictors)
+  if (!all(needed %in% names(df))) {
+    return(tibble(model = label, n = 0L, r_squared = NA_real_, adj_r_squared = NA_real_,
+                  term = NA_character_, estimate = NA_real_, std.error = NA_real_, p.value = NA_real_))
+  }
+  fit_df <- df %>% select(all_of(needed)) %>% drop_na()
+  if (nrow(fit_df) < max(4, length(predictors) + 2)) {
+    return(tibble(model = label, n = nrow(fit_df), r_squared = NA_real_, adj_r_squared = NA_real_,
+                  term = NA_character_, estimate = NA_real_, std.error = NA_real_, p.value = NA_real_))
+  }
+  formula <- stats::reformulate(predictors, response = response)
+  fit <- lm(formula, data = fit_df)
+  broom::tidy(fit) %>%
+    mutate(
+      model = label,
+      n = nrow(fit_df),
+      r_squared = summary(fit)$r.squared,
+      adj_r_squared = summary(fit)$adj.r.squared
+    ) %>%
+    select(model, n, r_squared, adj_r_squared, term, estimate, std.error, p.value)
+}
+```
+
+# Section 03 — Loading Dataset
+
+```{r load-data}
+override_path <- Sys.getenv("THUNDERBOLTS_MAIN", unset = "")
+default_paths <- c(
+  'MRI_data/analysis/tests/v12_kwsn/SN_nmdata_irredeemable_v12_kwsn_KW_legacy_clamp_prob15_kwsn_KW_legacy_clamp_merged_with_covariates.txt',
+  'MRI_data/analysis/tests/v9/KW/ptfix/clamp/SN_nmdata_irredeemable_v9_KW_ptfix_clamp_prob15_KW_ptfix_clamp_with_covariates.txt'
+)
+metrics_path <- if (nzchar(override_path) && file.exists(override_path)) {
+  override_path
+} else {
+  resolved <- first_existing(default_paths)
+  if (is.na(resolved)) stop('No Thunderbolts input table found; set THUNDERBOLTS_MAIN.')
+  resolved
+}
+message(glue('[Thunderbolts_v5_CPonly] Loading {metrics_path}'))
+metrics <- read_delim_auto(metrics_path) %>% mutate(sub = as.character(sub))
+
+numeric_cols <- intersect(
+  c(
+    'CNR_CP_corrected', 'CNR_CP_raw',
+    'intensity_corrected', 'intensity_raw',
+    'intensity_maximum', 'intensity_minimum',
+    'age', 'years_education', 'MOCA', 'moca', 'MOCA_memory',
+    'trailsb', 'nart_raw', 'NART_raw', 'SBT'
+  ),
+  names(metrics)
+)
+if (length(numeric_cols) > 0) {
+  metrics <- metrics %>% mutate(across(all_of(numeric_cols), as.numeric))
+}
+
+metrics <- metrics %>%
+  mutate(
+    gender_clean = clean_factor(resolve_gender_column(.)),
+    race_clean = clean_factor(resolve_race_column(.))
+  ) %>%
+  mutate(
+    race_group_collapsed = clean_factor(collapse_race_group(as.character(race_clean))),
+    education_years = resolve_numeric_column(., c('years_education')),
+    moca_score = resolve_numeric_column(., c('MOCA', 'moca')),
+    trailsb_score = resolve_numeric_column(., c('trailsb')),
+    nart_score = resolve_numeric_column(., c('NART_raw', 'nart_raw'))
+  )
+
+age_breaks <- c(18, 30, 50, 60, 70, Inf)
+age_labels <- c('18-30','30-50','50-60','60-70','70+')
+metrics <- metrics %>% mutate(
+  age_group = cut(age, breaks = age_breaks, include.lowest = TRUE, right = FALSE, labels = age_labels)
+)
+```
+
+```{r dataset-summary}
+tibble(
+  rows = nrow(metrics),
+  unique_subjects = dplyr::n_distinct(metrics$sub),
+  cp_corrected_n = sum(!is.na(metrics$CNR_CP_corrected) & !is.na(metrics$intensity_corrected)),
+  cp_raw_n = if ('CNR_CP_raw' %in% names(metrics) && 'intensity_raw' %in% names(metrics)) {
+    sum(!is.na(metrics$CNR_CP_raw) & !is.na(metrics$intensity_raw))
+  } else {
+    0L
+  }
+)
+```
+
+```{r covariate-coverage}
+tibble(
+  age_n = sum(!is.na(metrics$age)),
+  gender_n = sum(!is.na(metrics$gender_clean)),
+  race_raw_n = sum(!is.na(metrics$race_clean)),
+  race_collapsed_n = sum(!is.na(metrics$race_group_collapsed)),
+  education_n = sum(!is.na(metrics$education_years)),
+  moca_n = sum(!is.na(metrics$moca_score)),
+  trailsb_n = sum(!is.na(metrics$trailsb_score)),
+  nart_n = sum(!is.na(metrics$nart_score))
+)
+```
+
+```{r race-collapse-audit}
+metrics %>%
+  count(race_clean, race_group_collapsed, sort = TRUE)
+```
+
+# Section 04 — CP-Only CNR and Intensity
+
+## 04.1 Corrected CP CNR vs corrected SN intensity
+
+```{r cp-cnr-intensity-corrected}
+df_cp <- metrics %>% select(sub, intensity_corrected, CNR_CP_corrected) %>% drop_na()
+ggplot(df_cp, aes(x = intensity_corrected, y = CNR_CP_corrected)) +
+  geom_point(alpha = 0.6, colour = '#0072B2') +
+  geom_smooth(method = 'lm', se = FALSE, colour = '#D55E00') +
+  labs(
+    title = 'CP CNR vs corrected SN intensity',
+    x = 'SN intensity (corrected)',
+    y = 'CNR (SN-control / CP)'
+  ) +
+  gg_theme_sn_asr
+```
+
+```{r describe-cp-cnr-intensity-corrected, results='asis'}
+describe_plot(
+  'CP CNR vs corrected SN intensity',
+  'Each point is one subject. The red line is the best-fitting linear trend between corrected SN intensity and the CP-based CNR estimate.'
+)
+```
+
+## 04.2 Raw CP CNR vs raw SN intensity
+
+```{r cp-cnr-intensity-raw}
+if (!all(c('intensity_raw', 'CNR_CP_raw') %in% names(metrics))) {
+  cat('Raw CP columns unavailable; skipping raw CP scatter.\n')
+} else {
+  df_cp_raw <- metrics %>% select(sub, intensity_raw, CNR_CP_raw) %>% drop_na()
+  ggplot(df_cp_raw, aes(x = intensity_raw, y = CNR_CP_raw)) +
+    geom_point(alpha = 0.6, colour = '#7F7F7F') +
+    geom_smooth(method = 'lm', se = FALSE, colour = '#E69F00') +
+    labs(
+      title = 'CP CNR vs raw SN intensity',
+      x = 'SN intensity (raw zeropad)',
+      y = 'CNR (SN-control / CP, raw)'
+    ) +
+    gg_theme_sn_asr
+}
+```
+
+## 04.3 Correlation summary
+
+```{r cp-correlation-summary}
+bind_rows(
+  safe_cor_frame(metrics, 'intensity_corrected', 'CNR_CP_corrected', 'Corrected intensity vs corrected CP CNR'),
+  safe_cor_frame(metrics, 'intensity_raw', 'CNR_CP_raw', 'Raw intensity vs raw CP CNR'),
+  safe_cor_frame(metrics, 'intensity_maximum', 'CNR_CP_corrected', 'Corrected intensity maximum vs corrected CP CNR'),
+  safe_cor_frame(metrics, 'intensity_minimum', 'CNR_CP_corrected', 'Corrected intensity minimum vs corrected CP CNR')
+)
+```
+
+```{r describe-cp-correlation-summary, results='asis'}
+describe_test(
+  'CP-only CNR vs intensity coupling',
+  'Quantify how tightly SN intensity tracks the CP-based CNR measurement once PT, Brainstem, and nigrosome analyses are removed.',
+  'Pearson correlations are reported for corrected and raw CP-specific CNR, plus the maximum and minimum corrected SN intensity summaries.'
+)
+```
+
+## 04.4 Negative control
+
+```{r cp-negative-control}
+set.seed(20260227)
+neg_metrics <- metrics %>% mutate(intensity_nc = sample(intensity_corrected))
+safe_cor_frame(neg_metrics, 'intensity_nc', 'CNR_CP_corrected', 'Shuffled corrected intensity vs corrected CP CNR')
+```
+
+```{r describe-cp-negative-control, results='asis'}
+describe_test(
+  'CP-only negative control',
+  'Check that the corrected CP relationship disappears when corrected SN intensity is shuffled across subjects.',
+  'The CP CNR column is left untouched while the corrected SN intensity vector is permuted.'
+)
+```
+
+# Section 05 — CP Regression Diagnostics
+
+```{r cp-regression-diagnostics}
+cp_models <- bind_rows(
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('intensity_corrected'), 'CP corrected ~ corrected intensity'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('intensity_corrected', 'age'), 'CP corrected ~ corrected intensity + age'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('intensity_corrected', 'age', 'gender_clean', 'race_group_collapsed'), 'CP corrected ~ corrected intensity + age + gender + collapsed race')
+)
+cp_models
+```
+
+```{r describe-cp-regression-diagnostics, results='asis'}
+describe_test(
+  'CP-only regression diagnostics',
+  'Measure how much variance in CP CNR is explained by corrected SN intensity alone and after basic demographics are added.',
+  'Linear models are fit only when the required columns are present with enough complete rows.'
+)
+```
+
+# Section 06 — Age Analyses
+
+## 06.1 Age vs corrected SN intensity
+
+```{r age-vs-intensity}
+age_intensity_df <- metrics %>% select(sub, age, intensity_corrected) %>% drop_na()
+ggplot(age_intensity_df, aes(x = age, y = intensity_corrected)) +
+  geom_point(alpha = 0.6, colour = '#0072B2') +
+  geom_smooth(method = 'lm', se = FALSE, colour = '#D55E00') +
+  labs(title = 'Age vs corrected SN intensity', x = 'Age', y = 'Corrected SN intensity') +
+  gg_theme_sn_asr
+```
+
+## 06.2 Age vs corrected CP CNR
+
+```{r age-vs-cp}
+age_cp_df <- metrics %>% select(sub, age, CNR_CP_corrected) %>% drop_na()
+ggplot(age_cp_df, aes(x = age, y = CNR_CP_corrected)) +
+  geom_point(alpha = 0.6, colour = '#0072B2') +
+  geom_smooth(method = 'lm', se = FALSE, colour = '#D55E00') +
+  labs(title = 'Age vs corrected CP CNR', x = 'Age', y = 'Corrected CP CNR') +
+  gg_theme_sn_asr
+```
+
+```{r age-models}
+bind_rows(
+  safe_lm_summary(metrics, 'intensity_corrected', c('age'), 'Corrected SN intensity ~ age'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age'), 'Corrected CP CNR ~ age'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed'), 'Corrected CP CNR ~ age + gender + collapsed race')
+)
+```
+
+# Section 07 — Demographic Stratification
+
+## 07.1 CP CNR by gender
+
+```{r cp-by-gender}
+gender_df <- metrics %>% select(sub, gender_clean, CNR_CP_corrected) %>% drop_na()
+if (nrow(gender_df) == 0) {
+  cat('Gender or CP CNR unavailable; skipping gender panel.\n')
+} else {
+  ggplot(gender_df, aes(x = gender_clean, y = CNR_CP_corrected, fill = gender_clean)) +
+    geom_boxplot(alpha = 0.4, outlier.shape = NA) +
+    geom_jitter(width = 0.12, alpha = 0.5, size = 1) +
+    labs(title = 'Corrected CP CNR by gender', x = 'Gender', y = 'Corrected CP CNR') +
+    gg_theme_sn_asr
+}
+```
+
+## 07.2 CP CNR by collapsed race
+
+```{r cp-by-race}
+race_df <- metrics %>% select(sub, race_group_collapsed, CNR_CP_corrected) %>% drop_na()
+if (nrow(race_df) == 0) {
+  cat('Race or CP CNR unavailable; skipping race panel.\n')
+} else {
+  ggplot(race_df, aes(x = race_group_collapsed, y = CNR_CP_corrected, fill = race_group_collapsed)) +
+    geom_boxplot(alpha = 0.4, outlier.shape = NA) +
+    geom_jitter(width = 0.12, alpha = 0.5, size = 1) +
+    labs(title = 'Corrected CP CNR by collapsed race', x = 'Collapsed race', y = 'Corrected CP CNR') +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1)) +
+    gg_theme_sn_asr
+}
+```
+
+```{r demographic-models}
+bind_rows(
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('gender_clean'), 'Corrected CP CNR ~ gender'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('race_group_collapsed'), 'Corrected CP CNR ~ collapsed race'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('gender_clean', 'age'), 'Corrected CP CNR ~ gender + age'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('race_group_collapsed', 'age'), 'Corrected CP CNR ~ collapsed race + age'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed'), 'Corrected CP CNR ~ age + gender + collapsed race')
+)
+```
+
+```{r describe-demographic-models, results='asis'}
+describe_test(
+  'Collapsed-race demographic contrasts',
+  'Re-test the CP demographic contrasts after collapsing the sparse free-text race labels into coarser groups with usable sample sizes.',
+  'The grouped race labels are derived from the raw race column because the NIH race/ethnicity fields are blank in this merged v12 table.'
+)
+```
+
+# Section 08 — Cognition Models For CP CNR
+
+```{r cp-cognition-models}
+bind_rows(
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'education_years'), 'Corrected CP CNR ~ age + gender + collapsed race + education'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'moca_score'), 'Corrected CP CNR ~ age + gender + collapsed race + MOCA'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'trailsb_score'), 'Corrected CP CNR ~ age + gender + collapsed race + Trails B'),
+  safe_lm_summary(metrics, 'CNR_CP_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'nart_score'), 'Corrected CP CNR ~ age + gender + collapsed race + NART')
+)
+```
+
+```{r describe-cp-cognition-models, results='asis'}
+describe_test(
+  'CP cognition-adjusted models',
+  'Ask whether education or cognition shifts the corrected CP CNR signal after the core demographic terms are already in the model.',
+  'Each cognition variable is added one at a time on top of age, gender, and the collapsed race grouping.'
+)
+```
+
+# Section 09 — Corrected Intensity Models
+
+## 09.1 Intensity demographics
+
+```{r intensity-demographic-models}
+bind_rows(
+  safe_lm_summary(metrics, 'intensity_corrected', c('age'), 'Corrected SN intensity ~ age'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('gender_clean'), 'Corrected SN intensity ~ gender'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('race_group_collapsed'), 'Corrected SN intensity ~ collapsed race'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('age', 'gender_clean', 'race_group_collapsed'), 'Corrected SN intensity ~ age + gender + collapsed race')
+)
+```
+
+## 09.2 Intensity cognition-adjusted models
+
+```{r intensity-cognition-models}
+bind_rows(
+  safe_lm_summary(metrics, 'intensity_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'education_years'), 'Corrected SN intensity ~ age + gender + collapsed race + education'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'moca_score'), 'Corrected SN intensity ~ age + gender + collapsed race + MOCA'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'trailsb_score'), 'Corrected SN intensity ~ age + gender + collapsed race + Trails B'),
+  safe_lm_summary(metrics, 'intensity_corrected', c('age', 'gender_clean', 'race_group_collapsed', 'nart_score'), 'Corrected SN intensity ~ age + gender + collapsed race + NART')
+)
+```
+
+```{r describe-intensity-models, results='asis'}
+describe_test(
+  'Corrected intensity demographic and cognition models',
+  'Mirror the CP models using corrected SN intensity itself as the outcome so we can tell whether any demographic or cognition effects are intensity-driven rather than CNR-driven.',
+  'The same collapsed race grouping and one-at-a-time cognition additions are reused for the intensity models.'
+)
+```
+
+# Section 10 — Session Notes
+
+This CP-only Thunderbolts variant intentionally excludes PT-control, Brainstem,
+and all nigrosome analyses. It is meant for a focused readout of the
+SN-control/CP background relationship on the supplied Irredeemable table.

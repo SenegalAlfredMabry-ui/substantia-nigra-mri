@@ -1,0 +1,409 @@
+---
+title: "SN_ASR_DRAFT_analysis — MIRRORED the LC for the SN (includes future rostral/caudal & left/right stubs)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    output_file: 'SN_ASR_DRAFT_analysis_`r format(Sys.time(), "%Y%m%d")`.html'
+output_dir: MRI_data/analysis
+---
+
+```{r global_options, include=FALSE}
+# Clears the R environment so every knit starts from the same clean state.
+rm(list=ls()) # clear global environment (as in original)
+library(knitr)
+#knitr::opts_chunk$set(fig.width=3, fig.height=3, warning=FALSE, message=FALSE)
+#opts_knit$set(global.par = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(file.path(dirname(knitr::current_input()), '..')))
+options(knitr.duplicate.label = 'allow')
+```
+
+```{r include=FALSE}
+# This keeps the margin tweak hidden but ensures later plots have the right spacing.
+par(mar=c(5,5,0,0)) # keep separate, as in original
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+# This loads all plotting and mixed-model packages needed for the mirrored SN analyses.
+# Packages used in the original LC analyses + mirrors here
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(mgcv)
+library(gratia)
+library(broom.mixed)
+library(scales)
+library(janitor)
+library(reshape2)
+library(ggokabeito)  # scale_color_okabe_ito()
+library(sjPlot)      # tab_model(), plot_model()
+```
+
+## Plotting parameters and theme (unchanged from original)
+```{r}
+# This defines the shared plot formatting so every figure follows the same style.
+text.size = 10
+se.width = .075
+
+ggplot.theme <- theme(
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.background = element_blank(),
+  panel.spacing = unit(0.2,'in'),
+  axis.line.x = element_line(size = 0.5, colour = "black"),
+  axis.line.y = element_line(size = 0.5, colour = "black"),
+  axis.title = element_text(size = text.size),
+  axis.text = element_text(size = text.size),
+  strip.background = element_rect(colour = 'black'),
+  strip.text = element_text(size = text.size),
+  legend.direction='horizontal',
+  legend.spacing=unit(.02,'in'),
+  legend.position = 'top',
+  legend.background = element_blank(),
+  legend.margin = margin(rep(.1,4)),
+  legend.key = element_rect(fill=NA),
+  legend.title = element_blank(),
+  legend.text = element_text(size = 12),
+  legend.text.align = 1
+)
+```
+
+## Load datasets (SN = target; cerebellum kept as control)
+
+This section loads the neuromelanin summary tables. BLACK ANT writes the SN metrics
+to `${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/`, so the script
+prefers that path but falls back to the legacy MOTIP locations when necessary. The
+same fallback logic applies to the cerebellum control table so collaborators on
+different machines can knit without editing paths.
+```{r load-data}
+# This pulls the SN and cerebellum measurements off disk so the analysis has data to work with.
+# RELIES ON: literal file paths (but can be overridden via SN_ASR_SN_TABLE/SN_ASR_SN_LABEL env vars)
+sn_override <- Sys.getenv("SN_ASR_SN_TABLE")
+sn_label_override <- Sys.getenv("SN_ASR_SN_LABEL")
+
+resolve_repo_path <- function(path) {
+  if (!nzchar(path)) {
+    return("")
+  }
+  if (grepl("^/", path)) {
+    return(path)
+  }
+  base_dir <- tryCatch({
+    if ("knitr" %in% loadedNamespaces()) {
+      input_file <- knitr::current_input()
+      if (nzchar(input_file)) {
+        return(dirname(input_file))
+      }
+    }
+    getwd()
+  }, error = function(e) getwd())
+  normalizePath(file.path(base_dir, "..", path), winslash = "/", mustWork = FALSE)
+}
+
+expand_candidates <- function(paths) {
+  expanded <- character()
+  for (pattern in paths) {
+    if (grepl("\\*", pattern)) {
+      matches <- Sys.glob(pattern)
+      if (length(matches) > 1) {
+        info <- file.info(matches)
+        matches <- matches[order(info$mtime, decreasing = TRUE)]
+      }
+      expanded <- c(expanded, matches)
+    } else {
+      expanded <- c(expanded, pattern)
+    }
+  }
+  unique(expanded)
+}
+
+sn_candidate_patterns <- c("${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_V4_*.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_V4_latest.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_V3_*.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_V3_latest.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_V3.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved_2.txt",
+                           "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/SN_nmdata_autosaved.txt",
+                           "${MOTIP_ROOT:-/path/to/MOTIP2018}/scripts/tse/SN_nmdata_autosaved.txt",
+                           "${MOTIP_ROOT:-/path/to/MOTIP2018}/scripts/tse/SN_nmdata_autosaved.txt")
+
+sn_candidates <- expand_candidates(sn_candidate_patterns)
+
+sn_path <- if (nzchar(sn_override)) {
+  resolve_repo_path(sn_override)
+} else {
+  existing <- sn_candidates[file.exists(sn_candidates)]
+  if (length(existing) == 0) "" else existing[1]
+}
+
+if (!nzchar(sn_path) || !file.exists(sn_path)) {
+  stop("Could not locate SN_nmdata_autosaved*.txt in SNHEART or MOTIP folders")
+}
+
+sn_dataset_label <- if (nzchar(sn_label_override)) {
+  sn_label_override
+} else if (grepl("V4", basename(sn_path))) {
+  "BlackANT_V4"
+} else if (grepl("V3", basename(sn_path))) {
+  "BlackANT_V3"
+} else if (grepl("_2", basename(sn_path))) {
+  "BlackANT_V2"
+} else {
+  "BlackANT_V1"
+}
+sn_dataset_slug <- gsub("[^A-Za-z0-9]+", "", sn_dataset_label)
+if (!nzchar(sn_dataset_slug)) sn_dataset_slug <- "SN"
+sn_dataset_path <- sn_path
+message(sprintf("Using SN dataset: %s (%s)", sn_dataset_label, sn_dataset_path))
+
+cb_primary   <- "${SNHEART_ROOT:-/path/to/SNHEART}/MRI_data/analysis/cerebellumdata_autosaved.txt"
+cb_fallbacks <- c("${MOTIP_ROOT:-/path/to/MOTIP2018}/scripts/tse/cerebellumdata_autosaved.txt",
+                  "${MOTIP_ROOT:-/path/to/MOTIP2018}/scripts/tse/cerebellumdata_autosaved.txt")
+cb_path <- if (file.exists(cb_primary)) {
+  cb_primary
+} else {
+  found <- cb_fallbacks[file.exists(cb_fallbacks)]
+  if (length(found) == 0) "" else found[1]
+}
+if (!nzchar(cb_path)) {
+  stop("Could not locate cerebellumdata_autosaved.txt in SNHEART or MOTIP folders")
+}
+
+read_csv_file <- function(path) {
+  if (requireNamespace("readr", quietly = TRUE)) {
+    readr::read_csv(path, show_col_types = FALSE)
+  } else {
+    read.table(path, sep = ",", header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+  }
+}
+
+SN <- as.data.frame(read_csv_file(sn_path))
+cerebellum <- as.data.frame(read_csv_file(cb_path))
+if (!"subject" %in% names(SN)) {
+  SN$subject <- if ("sub" %in% names(SN)) SN[["sub"]] else NA
+}
+if (!"subject" %in% names(cerebellum)) {
+  cerebellum$subject <- if ("sub" %in% names(cerebellum)) cerebellum[["sub"]] else NA
+}
+
+```
+
+> **SN dataset in use:** `r sn_dataset_label` (`r sn_dataset_path`)
+
+```{r echo=FALSE, results='asis'}
+if (identical(sn_dataset_label, "BlackANT_V3")) {
+  cat("<em>V3 note:</em> CNR still uses the raw TSE signal with the original control ROI, while the neuromelanin intensity column now averages the corrected image over only the top 30% of probability-weighted SN voxels. That masking difference can make intensity and CNR move in opposite directions and does not indicate a calculation error.\n")
+} else if (identical(sn_dataset_label, "BlackANT_V4")) {
+  cat("<em>V4 note:</em> SN and control masks now keep the same percentile and the exported CNR column is computed on the corrected neuromelanin image (matching the intensity column). Use `CNR_raw` if you need the legacy raw-grid calculation.\n")
+}
+```
+
+colnames(SN)[1] <- "subject"
+colnames(cerebellum)[1] <- "subject"
+
+SN <- SN %>% mutate(subject = as.numeric(subject))
+
+```{r ensure-age, message=FALSE}
+# Ensure age exists before the low-signal summaries. The uber roster holds the
+# demographic columns used later in the report, but some SN tables (including
+# the new Irredeemable exports) arrive without age baked in. Pull just the age
+# column now so the early chunks can sort/label the low group before the full
+# covariate merge runs inside the section body.
+if (!"age" %in% names(SN)) {
+  uber_paths <- c("${SNHEART_ROOT:-/path/to/SNHEART}/behavioral/uber_data_20240704.csv",
+                  "${MOTIP_ROOT:-/path/to/MOTIP2018}/uber_data_20240704.csv",
+                  "${MOTIP_ROOT:-/path/to/MOTIP2018}/uber_data_20240704.csv",
+                  "${MOTIP_ROOT:-/path/to/MOTIP2018}/uber_data_20240704.csv")
+  uber_file <- uber_paths[file.exists(uber_paths)][1]
+  if (!is.na(uber_file)) {
+    uber_age <- as.data.frame(read_csv_file(uber_file)) %>%
+      dplyr::select(subject, age)
+    SN <- SN %>%
+      left_join(uber_age, by = "subject")
+  } else {
+    SN$age <- NA_real_
+  }
+}
+```
+
+```{r low30-flags, message=FALSE}
+calc_residuals <- function(df, response) {
+  required <- c(response, "age", "gender", "race")
+  if (!all(required[-1] %in% names(df))) {
+    return(rep(NA_real_, nrow(df)))
+  }
+  complete_idx <- complete.cases(df[, required])
+  residuals <- rep(NA_real_, nrow(df))
+  if (sum(complete_idx) < 12) {
+    return(residuals)
+  }
+  formula <- as.formula(paste(response, "~ age + gender + race"))
+  fit <- try(lm(formula, data = df[complete_idx, ]), silent = TRUE)
+  if (inherits(fit, "try-error")) {
+    return(residuals)
+  }
+  residuals[complete_idx] <- resid(fit)
+  residuals
+}
+
+if (!"gender" %in% names(SN)) {
+  if ("Gender" %in% names(SN)) {
+    SN$gender <- SN$Gender
+  } else {
+    SN$gender <- factor(rep(NA_character_, nrow(SN)))
+  }
+}
+if (!"race" %in% names(SN)) {
+  SN$race <- factor(rep(NA_character_, nrow(SN)))
+}
+SN$gender <- droplevels(factor(SN$gender))
+SN$race <- droplevels(factor(SN$race))
+
+low_overall_pct <- 0.30
+low_within_pct <- 0.20
+age_breaks <- c(18, 30, 50, 60, 70, Inf)
+age_labels <- c("18-30", "30-50", "50-60", "60-70", "70+")
+
+SN <- SN %>%
+  mutate(
+    CNR_residual = calc_residuals(., "CNR"),
+    intensity_residual = calc_residuals(., "intensity")
+  )
+
+cnr_resid_cut <- quantile(SN$CNR_residual, low_overall_pct, na.rm = TRUE)
+int_resid_cut <- quantile(SN$intensity_residual, low_overall_pct, na.rm = TRUE)
+
+SN <- SN %>%
+  mutate(
+    low_cnr_residual = if (is.finite(cnr_resid_cut)) CNR_residual <= cnr_resid_cut else NA,
+    low_intensity_residual = if (is.finite(int_resid_cut)) intensity_residual <= int_resid_cut else NA
+  )
+
+if ("age" %in% names(SN)) {
+  SN$age_decile <- cut(
+    SN$age,
+    breaks = age_breaks,
+    include.lowest = TRUE,
+    right = FALSE,
+    labels = age_labels
+  )
+}
+
+SN <- SN %>%
+  group_by(gender, race, age_decile) %>%
+  mutate(
+    low_cnr_within = percent_rank(CNR) <= low_within_pct,
+    low_intensity_within = percent_rank(intensity) <= low_within_pct
+  ) %>%
+  ungroup()
+
+SN <- SN %>%
+  mutate(
+    low_cnr = coalesce(low_cnr_within, low_cnr_residual, FALSE),
+    low_intensity = coalesce(low_intensity_within, low_intensity_residual, FALSE),
+    low_both = low_cnr & low_intensity,
+    low15_flag = low_cnr | low_intensity
+  )
+
+low_overlap <- SN %>%
+  count(low_cnr, low_intensity) %>%
+  arrange(desc(n))
+
+percent_overlap <- SN %>%
+  summarize(pct = mean(low_both, na.rm = TRUE)) %>%
+  pull(pct)
+```
+
+The residual-based 30th-percentile cutoffs land at `r signif(cnr_resid_cut, 3)` for CNR and `r signif(int_resid_cut, 3)` for intensity. Using the within-group 20th-percentile screen plus the residual threshold, `r scales::percent(mean(SN$low_cnr, na.rm = TRUE), accuracy = 0.1)` of the cohort is flagged as low CNR, `r scales::percent(mean(SN$low_intensity, na.rm = TRUE), accuracy = 0.1)` as low intensity, and `r scales::percent(percent_overlap, accuracy = 0.1)` fall into both groups.
+
+```{r low30-table, echo=FALSE}
+low_overlap
+```
+
+```{r low30-subjects, echo=FALSE}
+SN %>%
+  filter(low_both) %>%
+  arrange(age) %>%
+  select(subject, age, CNR, intensity) %>%
+  head(15)
+```
+
+These tables call out the overlapping low-signal subjects so we can sanity-check whether the same people drive both low-CNR and low-intensity cohorts.
+
+
+# Section A — Thresholded SN metrics
+
+Section A reruns the full SN analyses using the thresholded (> gcount cutoff) masks from Irredeemable Black ANT. All plots/tables below match the historical reports but now live under a dedicated heading.
+
+```{r sectionA-setup, include=FALSE}
+SN_variant_base <- SN
+cerebellum_variant_base <- cerebellum
+prepare_sn_variant <- function(sn_df, variant = c('thresholded','unthresholded')) {
+  variant <- match.arg(variant)
+  renamed <- sn_df
+  if (variant == 'unthresholded') {
+    rename_map <- c(
+      CNR = 'CNR_unthresholded',
+      CNR_peduncle = 'CNR_peduncle_unthresholded',
+      total_intensity = 'total_intensity_unthresholded',
+      intensity = 'intensity_unthresholded',
+      background_intensity = 'background_intensity_unthresholded',
+      total_volume = 'total_volume_unthresholded',
+      intensity_minimum = 'intensity_minimum_unthresholded',
+      intensity_maximum = 'intensity_maximum_unthresholded',
+      sn_voxels = 'sn_voxels_unthresholded',
+      sn_prob_mean = 'sn_prob_mean_unthresholded',
+      mean_raw_sn = 'mean_raw_sn_unthresholded',
+      mean_raw_control = 'mean_raw_control_unthresholded',
+      std_raw_control = 'std_raw_control_unthresholded',
+      mean_raw_peduncle = 'mean_raw_peduncle_unthresholded',
+      bright_voxels = 'bright_voxels_unthresholded',
+      bright_fraction = 'bright_fraction_unthresholded'
+    )
+    for (base_name in names(rename_map)) {
+      alt_name <- rename_map[[base_name]]
+      if (alt_name %in% names(renamed)) {
+        renamed[[base_name]] <- renamed[[alt_name]]
+      }
+    }
+  }
+  renamed
+}
+SN <- prepare_sn_variant(SN_variant_base, 'thresholded')
+cerebellum <- cerebellum_variant_base
+sn_variant_label <- paste(sn_dataset_label, '(thresholded)')
+SN <- SN %>%
+  mutate(age_decile = cut(
+    age,
+    breaks = age_breaks,
+    include.lowest = TRUE,
+    right = FALSE,
+    labels = age_labels
+  ))
+```
+
+```{r child='Scripts/SN_ASR_section_body.Rmd'}
+```
+
+# Section B — Unthresholded SN metrics
+
+Section B repeats every test after swapping in the unthresholded probabilistic masks (any voxel with >0 votes). Use these outputs when comparing against legacy autosaves or when you need the full SN volume without the gcount cutoff.
+
+```{r sectionB-setup, include=FALSE}
+SN <- prepare_sn_variant(SN_variant_base, 'unthresholded')
+cerebellum <- cerebellum_variant_base
+sn_variant_label <- paste(sn_dataset_label, '(unthresholded)')
+SN <- SN %>%
+  mutate(age_decile = cut(
+    age,
+    breaks = age_breaks,
+    include.lowest = TRUE,
+    right = FALSE,
+    labels = age_labels
+  ))
+```
+
+```{r child='Scripts/SN_ASR_section_body.Rmd'}
+```
